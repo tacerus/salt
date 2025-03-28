@@ -2,6 +2,7 @@
 These commands are used to create/destroy VMs, sync the local checkout
 to the VM and to run commands on the VM.
 """
+
 # pylint: disable=resource-leakage,broad-except,3rd-party-module-not-gated
 from __future__ import annotations
 
@@ -21,32 +22,21 @@ from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, cast
 
+import attr
+import boto3
+from botocore.exceptions import ClientError
 from ptscripts import Context, command_group
 from requests.exceptions import ConnectTimeout
+from rich.progress import (
+    BarColumn,
+    Column,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 import tools.utils
-
-try:
-    import attr
-    import boto3
-    from botocore.exceptions import ClientError
-    from rich.progress import (
-        BarColumn,
-        Column,
-        Progress,
-        TaskProgressColumn,
-        TextColumn,
-        TimeRemainingColumn,
-    )
-except ImportError:
-    print(
-        "\nPlease run 'python -m pip install -r "
-        "requirements/static/ci/py{}.{}/tools.txt'\n".format(*sys.version_info),
-        file=sys.stderr,
-        flush=True,
-    )
-    raise
-
 
 if TYPE_CHECKING:
     # pylint: disable=no-name-in-module
@@ -57,8 +47,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 STATE_DIR = tools.utils.REPO_ROOT / ".vms-state"
-with tools.utils.REPO_ROOT.joinpath("cicd", "golden-images.json").open() as rfh:
-    AMIS = json.load(rfh)
 REPO_CHECKOUT_ID = hashlib.sha256(
     "|".join(list(platform.uname()) + [str(tools.utils.REPO_ROOT)]).encode()
 ).hexdigest()
@@ -75,10 +63,10 @@ vm.add_argument("--region", help="The AWS region.", default=AWS_REGION)
         "name": {
             "help": "The VM Name",
             "metavar": "VM_NAME",
-            "choices": list(AMIS),
+            "choices": sorted(tools.utils.get_golden_images()),
         },
         "key_name": {
-            "help": "The SSH key name.",
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment",
         },
         "instance_type": {
             "help": "The instance type to use.",
@@ -110,7 +98,7 @@ vm.add_argument("--region", help="The AWS region.", default=AWS_REGION)
 def create(
     ctx: Context,
     name: str,
-    key_name: str = os.environ.get("RUNNER_NAME"),  # type: ignore[assignment]
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
     instance_type: str = None,
     no_delete: bool = False,
     no_destroy_on_failure: bool = False,
@@ -222,14 +210,18 @@ def ssh(ctx: Context, name: str, command: list[str], sudo: bool = False):
             "help": "The VM Name",
             "metavar": "VM_NAME",
         },
+        "download": {
+            "help": "Rsync from the remote target to local salt checkout",
+            "action": "store_true",
+        },
     }
 )
-def rsync(ctx: Context, name: str):
+def rsync(ctx: Context, name: str, download: bool = False):
     """
     Sync local checkout to VM.
     """
     vm = VM(ctx=ctx, name=name, region_name=ctx.parser.options.region)
-    vm.upload_checkout()
+    vm.upload_checkout(download=download)
 
 
 @vm.command(
@@ -270,6 +262,22 @@ def rsync(ctx: Context, name: str):
                 "--print-tests-selection",
             ],
         },
+        "print_system_info": {
+            "help": "Print the system information",
+            "action": "store_true",
+            "flags": [
+                "--psi",
+                "--print-system-information",
+            ],
+        },
+        "print_system_info_only": {
+            "help": "Print the system information and exit",
+            "action": "store_true",
+            "flags": [
+                "--psio",
+                "--print-system-information-only",
+            ],
+        },
         "skip_code_coverage": {
             "help": "Skip tracking code coverage",
             "action": "store_true",
@@ -300,8 +308,10 @@ def test(
     skip_requirements_install: bool = False,
     print_tests_selection: bool = False,
     print_system_info: bool = False,
+    print_system_info_only: bool = False,
     skip_code_coverage: bool = False,
     envvars: list[str] = None,
+    fips: bool = False,
 ):
     """
     Run test in the VM.
@@ -311,6 +321,7 @@ def test(
         "PRINT_TEST_PLAN_ONLY": "0",
         "SKIP_INITIAL_ONEDIR_FAILURES": "1",
         "SKIP_INITIAL_GH_ACTIONS_FAILURES": "1",
+        "COVERAGE_CONTEXT": name,
     }
     if "LANG" in os.environ:
         env["LANG"] = os.environ["LANG"]
@@ -320,14 +331,22 @@ def test(
         env["PRINT_TEST_SELECTION"] = "1"
     else:
         env["PRINT_TEST_SELECTION"] = "0"
-    if skip_code_coverage:
-        env["SKIP_CODE_COVERAGE"] = "1"
-    else:
-        env["SKIP_CODE_COVERAGE"] = "0"
+
+    # skip running code coverage for now
+    ## if skip_code_coverage:
+    ##     env["SKIP_CODE_COVERAGE"] = "1"
+    ## else:
+    ##     env["SKIP_CODE_COVERAGE"] = "0"
+    env["SKIP_CODE_COVERAGE"] = "1"
+
     if print_system_info:
         env["PRINT_SYSTEM_INFO"] = "1"
     else:
         env["PRINT_SYSTEM_INFO"] = "0"
+    if print_system_info_only:
+        env["PRINT_SYSTEM_INFO_ONLY"] = "1"
+    else:
+        env["PRINT_SYSTEM_INFO_ONLY"] = "0"
     if (
         skip_requirements_install
         or os.environ.get("SKIP_REQUIREMENTS_INSTALL", "0") == "1"
@@ -336,6 +355,9 @@ def test(
     if "photonos" in name:
         skip_known_failures = os.environ.get("SKIP_INITIAL_PHOTONOS_FAILURES", "1")
         env["SKIP_INITIAL_PHOTONOS_FAILURES"] = skip_known_failures
+        if fips:
+            env["FIPS_TESTRUN"] = "1"
+            vm.run(["tdnf", "install", "-y", "openssl-fips-provider"], sudo=True)
     if envvars:
         for key in envvars:
             if key not in os.environ:
@@ -547,6 +569,24 @@ def combine_coverage(ctx: Context, name: str):
 
 
 @vm.command(
+    name="create-xml-coverage-reports",
+    arguments={
+        "name": {
+            "help": "The VM Name",
+            "metavar": "VM_NAME",
+        },
+    },
+)
+def create_xml_coverage_reports(ctx: Context, name: str):
+    """
+    Create XML code coverage reports in the VM.
+    """
+    vm = VM(ctx=ctx, name=name, region_name=ctx.parser.options.region)
+    returncode = vm.create_xml_coverage_reports()
+    ctx.exit(returncode)
+
+
+@vm.command(
     name="download-artifacts",
     arguments={
         "name": {
@@ -561,6 +601,166 @@ def download_artifacts(ctx: Context, name: str):
     """
     vm = VM(ctx=ctx, name=name, region_name=ctx.parser.options.region)
     vm.download_artifacts()
+
+
+@vm.command(
+    name="sync-cache",
+    arguments={
+        "key_name": {
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment"
+        },
+        "delete": {
+            "help": "Delete the entries in the cache that don't align with ec2",
+            "action": "store_true",
+        },
+    },
+)
+def sync_cache(
+    ctx: Context,
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
+    delete: bool = False,
+):
+    """
+    Sync the cache
+    """
+    ec2_instances = _filter_instances_by_state(
+        _get_instances_by_key(ctx, key_name),
+        {"running"},
+    )
+
+    cached_instances = {}
+    if STATE_DIR.exists():
+        for state_path in STATE_DIR.iterdir():
+            try:
+                instance_id = (state_path / "instance-id").read_text()
+            except FileNotFoundError:
+                if not delete:
+                    log.info(
+                        "Would remove %s (No valid ID) from cache at %s",
+                        state_path.name,
+                        state_path,
+                    )
+                else:
+                    shutil.rmtree(state_path)
+                    log.info(
+                        "REMOVED %s (No valid ID) from cache at %s",
+                        state_path.name,
+                        state_path,
+                    )
+            else:
+                cached_instances[instance_id] = state_path.name
+
+    # Find what instances we are missing in our cached states
+    to_write = {}
+    to_remove = cached_instances.copy()
+    for instance in ec2_instances:
+        if instance.id not in cached_instances:
+            for tag in instance.tags:
+                if tag.get("Key") == "vm-name":
+                    to_write[tag.get("Value")] = instance
+                    break
+        else:
+            del to_remove[instance.id]
+
+    for cached_id, vm_name in to_remove.items():
+        if delete:
+            shutil.rmtree(STATE_DIR / vm_name)
+            log.info(
+                "REMOVED %s (%s) from cache at %s",
+                vm_name,
+                cached_id.strip(),
+                STATE_DIR / vm_name,
+            )
+        else:
+            log.info(
+                "Would remove %s (%s) from cache at %s",
+                vm_name,
+                cached_id.strip(),
+                STATE_DIR / vm_name,
+            )
+    if not delete and to_remove:
+        log.info("To force the removal of the above cache entries, pass --delete")
+
+    for name_tag, vm_instance in to_write.items():
+        vm_write = VM(ctx=ctx, name=name_tag, region_name=ctx.parser.options.region)
+        vm_write.instance = vm_instance
+        vm_write.write_state()
+
+
+@vm.command(
+    name="list",
+    arguments={
+        "key_name": {
+            "help": "The SSH key name. Will default to TOOLS_KEY_NAME in environment"
+        },
+        "states": {
+            "help": "The instance state to filter by.",
+            "flags": ["-s", "-state"],
+            "action": "append",
+        },
+    },
+)
+def list_vms(
+    ctx: Context,
+    key_name: str = os.environ.get("RUNNER_NAME") or os.environ.get("TOOLS_KEY_NAME"),  # type: ignore[assignment]
+    states: set[str] = None,
+):
+    """
+    List the vms associated with the given key.
+    """
+    instances = _filter_instances_by_state(
+        _get_instances_by_key(ctx, key_name),
+        states,
+    )
+
+    for instance in instances:
+        vm_state = instance.state["Name"]
+        ip_addr = instance.private_ip_address
+        ami = instance.image_id
+        vm_name = None
+        for tag in instance.tags:
+            if tag.get("Key") == "vm-name":
+                vm_name = tag.get("Value")
+                break
+
+        if vm_name is not None:
+            sep = "\n    "
+            extra_info = {
+                "IP": ip_addr,
+                "AMI": ami,
+            }
+            extras = sep + sep.join(
+                [f"{key}: {value}" for key, value in extra_info.items()]
+            )
+            log.info("%s (%s)%s", vm_name, vm_state, extras)
+
+
+def _get_instances_by_key(ctx: Context, key_name: str):
+    if key_name is None:
+        ctx.exit(1, "We need a key name to filter the instances by.")
+    ec2 = boto3.resource("ec2", region_name=ctx.parser.options.region)
+    # First let's get the instances on AWS associated with the key given
+    filters = [
+        {"Name": "key-name", "Values": [key_name]},
+    ]
+    try:
+        instances = list(
+            ec2.instances.filter(
+                Filters=filters,
+            )
+        )
+    except ClientError as exc:
+        if "RequestExpired" not in str(exc):
+            raise
+        ctx.error(str(exc))
+        ctx.exit(1)
+    return instances
+
+
+def _filter_instances_by_state(instances: list[Instance], states: set[str] | None):
+    if states is None:
+        return instances
+    return [instance for instance in instances if instance.state["Name"] in states]
 
 
 @attr.s(frozen=True, kw_only=True)
@@ -591,14 +791,15 @@ class VM:
 
     @config.default
     def _config_default(self):
+        golden_images = tools.utils.get_golden_images()
         config = AMIConfig(
             **{
                 key: value
-                for (key, value) in AMIS[self.name].items()
+                for (key, value) in golden_images[self.name].items()
                 if key in AMIConfig.__annotations__
             }
         )
-        log.info(f"Loaded VM Configuration:\n{config}")
+        log.info("Loaded VM Configuration:\n%s", config)
         return config
 
     @state_dir.default
@@ -640,7 +841,9 @@ class VM:
                 {"Name": "tag:vm-name", "Values": [self.name]},
                 {"Name": "tag:instance-client-id", "Values": [REPO_CHECKOUT_ID]},
             ]
-            log.info(f"Checking existing instance of {self.name}({self.config.ami})...")
+            log.info(
+                "Checking existing instance of %s(%s)...", self.name, self.config.ami
+            )
             try:
                 instances = list(
                     self.ec2.instances.filter(
@@ -670,15 +873,23 @@ class VM:
 
     def write_ssh_config(self):
         if self.ssh_config_file.exists():
-            return
+            if (
+                f"Hostname {self.instance.private_ip_address}"
+                in self.ssh_config_file.read_text()
+            ):
+                # If what's on config matches, then we're good
+                return
         if os.environ.get("CI") is not None:
             forward_agent = "no"
         else:
             forward_agent = "yes"
+        ciphers = ""
+        if "photonos" in self.name:
+            ciphers = "Ciphers=aes256-gcm@openssh.com,aes256-cbc,aes256-ctr,chacha20-poly1305@openssh.com,aes128-ctr,aes192-ctr,aes128-gcm@openssh.com"
         ssh_config = textwrap.dedent(
             f"""\
             Host {self.name}
-              Hostname {self.instance.public_ip_address or self.instance.private_ip_address}
+              Hostname {self.instance.private_ip_address}
               User {self.config.ssh_username}
               ControlMaster=no
               Compression=yes
@@ -686,6 +897,8 @@ class VM:
               StrictHostKeyChecking=no
               UserKnownHostsFile=/dev/null
               ForwardAgent={forward_agent}
+              PasswordAuthentication=no
+              {ciphers}
             """
         )
         self.ssh_config_file.write_text(ssh_config)
@@ -698,12 +911,12 @@ class VM:
         environment=None,
     ):
         if self.is_running:
-            log.info(f"{self!r} is already running...")
+            log.info("%r is already running...", self)
             return True
         self.get_ec2_resource.cache_clear()
 
         if environment is None:
-            environment = "prod"
+            environment = tools.utils.SPB_ENVIRONMENT
 
         create_timeout = self.config.create_timeout
         create_timeout_progress = 0
@@ -794,11 +1007,7 @@ class VM:
                     if tag["Key"] != "Name":
                         continue
                     private_value = f"-{environment}-vpc-private-"
-                    if started_in_ci and private_value in tag["Value"]:
-                        subnets[subnet.id] = subnet.available_ip_address_count
-                        break
-                    public_value = f"-{environment}-vpc-public-"
-                    if started_in_ci is False and public_value in tag["Value"]:
+                    if private_value in tag["Value"]:
                         subnets[subnet.id] = subnet.available_ip_address_count
                         break
             if subnets:
@@ -812,8 +1021,9 @@ class VM:
             log.info("Starting CI configured VM")
         else:
             # This is a developer running
-            log.info("Starting Developer configured VM")
-            # Get the develpers security group
+            log.info(
+                "Starting Developer configured VM In Environment '%s'", environment
+            )
             security_group_filters = [
                 {
                     "Name": "vpc-id",
@@ -822,10 +1032,6 @@ class VM:
                 {
                     "Name": "tag:spb:project",
                     "Values": ["salt-project"],
-                },
-                {
-                    "Name": "tag:spb:developer",
-                    "Values": ["true"],
                 },
             ]
             response = client.describe_security_groups(Filters=security_group_filters)
@@ -837,6 +1043,26 @@ class VM:
                 self.ctx.exit(1)
             # Override the launch template network interfaces config
             security_group_ids = [sg["GroupId"] for sg in response["SecurityGroups"]]
+            security_group_filters = [
+                {
+                    "Name": "vpc-id",
+                    "Values": [vpc.id],
+                },
+                {
+                    "Name": "tag:Name",
+                    "Values": [f"saltproject-{environment}-client-vpn-remote-access"],
+                },
+            ]
+            response = client.describe_security_groups(Filters=security_group_filters)
+            if not response.get("SecurityGroups"):
+                self.ctx.error(
+                    "Could not find the right VPN access security group. "
+                    f"Filters:\n{pprint.pformat(security_group_filters)}"
+                )
+                self.ctx.exit(1)
+            security_group_ids.extend(
+                [sg["GroupId"] for sg in response["SecurityGroups"]]
+            )
 
         progress = create_progress_bar()
         create_task = progress.add_task(
@@ -970,7 +1196,7 @@ class VM:
                 return error
 
             # Wait until we can SSH into the VM
-            host = self.instance.public_ip_address or self.instance.private_ip_address
+            host = self.instance.private_ip_address
 
         progress = create_progress_bar()
         connect_task = progress.add_task(
@@ -981,6 +1207,7 @@ class VM:
             proc = None
             checks = 0
             last_error = None
+            connection_refused_or_reset = False
             while ssh_connection_timeout_progress <= ssh_connection_timeout:
                 start = time.time()
                 if proc is None:
@@ -1020,6 +1247,11 @@ class VM:
                         break
                     proc.wait(timeout=3)
                     stderr = proc.stderr.read().strip()
+                    if connection_refused_or_reset is False and (
+                        "connection refused" in stderr.lower()
+                        or "connection reset" in stderr.lower()
+                    ):
+                        connection_refused_or_reset = True
                     if stderr:
                         stderr = f" Last Error: {stderr}"
                         last_error = stderr
@@ -1039,6 +1271,12 @@ class VM:
                     description=f"Waiting for SSH to become available at {host} ...{stderr or ''}",
                 )
 
+                if connection_refused_or_reset:
+                    # Since ssh is now running, and we're actually getting a connection
+                    # refused error message, let's try to ssh a little slower in order not
+                    # to get blocked
+                    time.sleep(10)
+
                 if checks >= 10 and proc is not None:
                     proc.kill()
                     proc = None
@@ -1052,12 +1290,12 @@ class VM:
     def destroy(self, no_wait: bool = False):
         try:
             if not self.is_running:
-                log.info(f"{self!r} is not running...")
+                log.info("%r is not running...", self)
                 return
             timeout = self.config.terminate_timeout
             timeout_progress = 0.0
             progress = create_progress_bar()
-            task = progress.add_task(f"Terminatting {self!r}...", total=timeout)
+            task = progress.add_task(f"Terminating {self!r}...", total=timeout)
             self.instance.terminate()
             try:
                 with progress:
@@ -1066,8 +1304,9 @@ class VM:
                         time.sleep(1)
                         if no_wait and not self.is_running:
                             log.info(
-                                f"{self!r} started the destroy process. "
-                                "Not waiting for completion of that process."
+                                "%r started the destroy process. Not waiting "
+                                "for completion of that process.",
+                                self,
                             )
                             break
                         if self.state == "terminated":
@@ -1095,13 +1334,15 @@ class VM:
             shutil.rmtree(self.state_dir, ignore_errors=True)
             self.instance = None
 
-    def upload_checkout(self, verbose=True):
+    def upload_checkout(self, verbose=True, download=False):
         rsync_flags = [
             "--delete",
             "--no-group",
             "--no-owner",
             "--exclude",
             ".nox/",
+            "--exclude",
+            ".tools-venvs/",
             "--exclude",
             ".pytest_cache/",
             "--exclude",
@@ -1114,7 +1355,7 @@ class VM:
             "--include",
             "artifacts/salt",
             "--include",
-            "pkg/artifacts/*",
+            "artifacts/pkg",
             # But we also want to exclude all other entries under artifacts/
             "--exclude",
             "artifacts/*",
@@ -1128,14 +1369,20 @@ class VM:
         # Remote repo path
         remote_path = self.upload_path.as_posix()
         rsync_remote_path = remote_path
-        if self.is_windows:
+        if sys.platform == "win32":
             for drive in ("c:", "C:"):
                 source = source.replace(drive, "/cygdrive/c")
-                rsync_remote_path = rsync_remote_path.replace(drive, "/cygdrive/c")
             source = source.replace("\\", "/")
+        if self.is_windows:
+            for drive in ("c:", "C:"):
+                rsync_remote_path = rsync_remote_path.replace(drive, "/cygdrive/c")
         destination = f"{self.name}:{rsync_remote_path}"
-        description = "Rsync local checkout to VM..."
-        self.rsync(source, destination, description, rsync_flags)
+        if download:
+            description = "Rsync VM to local checkout..."
+            self.rsync(f"{destination}/*", source, description, rsync_flags)
+        else:
+            description = "Rsync local checkout to VM..."
+            self.rsync(source, destination, description, rsync_flags)
         if self.is_windows:
             # rsync sets very strict file permissions and disables inheritance
             # we only need to reset permissions so they inherit from the parent
@@ -1148,6 +1395,7 @@ class VM:
         if not env:
             return
         write_env = {k: str(v) for (k, v) in env.items()}
+        write_env["TOOLS_DISTRO_SLUG"] = self.name
         write_env_filename = ".ci-env"
         write_env_filepath = tools.utils.REPO_ROOT / ".ci-env"
         write_env_filepath.write_text(json.dumps(write_env))
@@ -1190,7 +1438,7 @@ class VM:
                 env=env,
                 log_command_level=log_command_level,
             )
-            log.debug(f"Running {ssh_command!r} ...")
+            log.debug("Running %r ...", ssh_command)
             return self.ctx.run(
                 *ssh_command,
                 check=check,
@@ -1225,12 +1473,13 @@ class VM:
             cmd += ["--"] + session_args
         if env is None:
             env = {}
-        for key in ("CI", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"):
+        for key in ("CI", "PIP_INDEX_URL", "PIP_TRUSTED_HOST", "PIP_EXTRA_INDEX_URL"):
             if key in os.environ:
                 env[key] = os.environ[key]
         env["PYTHONUTF8"] = "1"
         env["OUTPUT_COLUMNS"] = str(self.ctx.console.width)
         env["GITHUB_ACTIONS_PIPELINE"] = "1"
+        env["RAISE_DEPRECATIONS_RUNTIME_ERRORS"] = "1"
         self.write_and_upload_dot_env(env)
         if self.is_windows is False and self.config.ssh_username != "root":
             sudo = True
@@ -1249,21 +1498,29 @@ class VM:
         """
         Combine the code coverage databases
         """
-        return self.run_nox("combine-coverage", session_args=[self.name])
+        return self.run_nox("combine-coverage-onedir")
+
+    def create_xml_coverage_reports(self):
+        """
+        Create XML coverage reports
+        """
+        return self.run_nox("create-xml-coverage-reports-onedir")
 
     def compress_dependencies(self):
         """
         Compress .nox/ into nox.<vm-name>.tar.* in the VM
         """
-        return self.run_nox("compress-dependencies", session_args=[self.name])
+        platform, arch = tools.utils.get_platform_and_arch_from_slug(self.name)
+        return self.run_nox("compress-dependencies", session_args=[platform, arch])
 
     def decompress_dependencies(self):
         """
         Decompress nox.<vm-name>.tar.* if it exists in the VM
         """
         env = {"DELETE_NOX_ARCHIVE": "1"}
+        platform, arch = tools.utils.get_platform_and_arch_from_slug(self.name)
         return self.run_nox(
-            "decompress-dependencies", session_args=[self.name], env=env
+            "decompress-dependencies", session_args=[platform, arch], env=env
         )
 
     def download_dependencies(self):
@@ -1271,9 +1528,11 @@ class VM:
         Download nox.<vm-name>.tar.* from VM
         """
         if self.is_windows:
-            dependencies_filename = f"nox.{self.name}.tar.gz"
+            extension = "tar.gz"
         else:
-            dependencies_filename = f"nox.{self.name}.tar.xz"
+            extension = "tar.xz"
+        platform, arch = tools.utils.get_platform_and_arch_from_slug(self.name)
+        dependencies_filename = f"nox.{platform}.{arch}.{extension}"
         remote_path = self.upload_path.joinpath(dependencies_filename).as_posix()
         if self.is_windows:
             for drive in ("c:", "C:"):
@@ -1315,16 +1574,17 @@ class VM:
             self.ctx.exit(1, "Could find the 'rsync' binary")
         if TYPE_CHECKING:
             assert rsync
+        ssh_cmd = " ".join(
+            self.ssh_command_args(
+                include_vm_target=False, log_command_level=logging.NOTSET
+            )
+        )
         cmd: list[str] = [
-            rsync,
+            f'"{rsync}"' if sys.platform == "win32" else rsync,
             "-az",
             "--info=none,progress2",
             "-e",
-            " ".join(
-                self.ssh_command_args(
-                    include_vm_target=False, log_command_level=logging.NOTSET
-                )
-            ),
+            f'"{ssh_cmd}"' if sys.platform == "win32" else ssh_cmd,
         ]
         if rsync_flags:
             cmd.extend(rsync_flags)
@@ -1334,9 +1594,11 @@ class VM:
                 destination,
             ]
         )
-        log.info(f"Running {' '.join(cmd)!r}")  # type: ignore[arg-type]
+        log.info("Running '%s'", " ".join(cmd))  # type: ignore[arg-type]
         progress = create_progress_bar(transient=True)
         task = progress.add_task(description, total=100)
+        if sys.platform == "win32":
+            cmd = [" ".join(cmd)]
         with progress:
             proc = subprocess.Popen(cmd, bufsize=1, stdout=subprocess.PIPE, text=True)
             completed = 0
@@ -1400,7 +1662,9 @@ class VM:
             remote_command.extend(list(command))
             log.log(
                 log_command_level,
-                f"Running {' '.join(remote_command[1:])!r} in {self.name}",
+                "Running '%s' in %s",
+                " ".join(remote_command[1:]),
+                self.name,
             )
             _ssh_command_args.extend(remote_command)
         return _ssh_command_args
