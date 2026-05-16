@@ -304,15 +304,9 @@ def bootstrap(name, user=None, silent=True):
         ret["comment"] = "Directory is already bootstrapped"
         return ret
 
-    # npm.install will return a string if it can't parse a JSON result
-    if isinstance(call, str):
-        ret["result"] = False
-        ret["changes"] = call
-        ret["comment"] = "Could not bootstrap directory"
-    else:
-        ret["result"] = True
-        ret["changes"] = {name: "Bootstrapped"}
-        ret["comment"] = "Directory was successfully bootstrapped"
+    ret["result"] = True
+    ret["changes"] = {name: "Bootstrapped", "output": ret}
+    ret["comment"] = "Directory was successfully bootstrapped"
 
     return ret
 
